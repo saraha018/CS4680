@@ -12,6 +12,7 @@ API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-fl
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 LOG_FILE = "chef_agent_log.txt"
 SAVED_RECIPES_DIR = "saved_recipes"
+MEAL_HISTORY_FILE = "meal_history.json" # File for long-term memory
 MODEL_NAME = "gemini-2.5-flash"
 
 # --- CUSTOM FETCH IMPLEMENTATION (For environment compatibility and Gemini API calls) ---
@@ -44,23 +45,16 @@ def custom_fetch(url, options):
 
 def initialize_state():
     """Initializes Streamlit session state variables and file structures."""
-    if 'log_history' not in st.session_state:
-        st.session_state.log_history = []
-    if 'scheduled_events' not in st.session_state:
-        st.session_state.scheduled_events = [] 
-    if 'last_recipe_title' not in st.session_state:
-        st.session_state.last_recipe_title = ""
-    if 'last_recipe_markdown' not in st.session_state:
-        st.session_state.last_recipe_markdown = ""
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    if 'confirm_scheduling' not in st.session_state:
-        st.session_state.confirm_scheduling = False
+    if 'log_history' not in st.session_state: st.session_state.log_history = []
+    if 'scheduled_events' not in st.session_state: st.session_state.scheduled_events = [] 
+    if 'last_recipe_title' not in st.session_state: st.session_state.last_recipe_title = ""
+    if 'last_recipe_markdown' not in st.session_state: st.session_state.last_recipe_markdown = ""
+    if 'messages' not in st.session_state: st.session_state.messages = []
+    if 'confirm_scheduling' not in st.session_state: st.session_state.confirm_scheduling = False
     
-    if 'processing_query' not in st.session_state:
-        st.session_state.processing_query = None
-    if 'current_view' not in st.session_state: # NEW: For Sidebar Navigation
-        st.session_state.current_view = "💬 Chef Remy Chat"
+    if 'processing_query' not in st.session_state: st.session_state.processing_query = None
+    if 'current_view' not in st.session_state: st.session_state.current_view = "💬 Chef Remy Chat"
+    if 'confirm_dislikes' not in st.session_state: st.session_state.confirm_dislikes = None 
         
     if not os.path.exists(SAVED_RECIPES_DIR):
         os.makedirs(SAVED_RECIPES_DIR)
@@ -81,24 +75,127 @@ def log_action(action: str, params: dict, status: str, result: str = "") -> None
     except Exception as e:
         st.warning(f"[ERROR] Could not write to audit file: {e}")
 
-# --- AGENT DSL DEFINITION ---
-DSL_SPECIFICATION = """
-Available Actions for Scheduling and File Management:
-1. ADD_REMINDER(time: str, message: str) - Sets a reminder for ingredient prep or checking leftovers. Time format examples: '1 hour from now', 'tomorrow 6 PM'.
-2. ADD_CALENDAR_EVENT(title: str, time: str, duration: str) - Schedules a cooking event. Duration examples: '1.5 hours'.
-3. SAVE_RECIPE(filename: str, content: str) - Saves the full recipe content to a local file for future access.
-"""
+# --- MEMORY AND TOOL MANAGEMENT ---
 
-# --- 2. PROMPT ENGINEERING (Chat Intent + Recipe Generation) ---
+def get_memory_data():
+    """Loads all memory data (history and dislikes) from the local JSON file."""
+    default_data = {"history": [], "disliked_ingredients": []}
+    if not os.path.exists(MEAL_HISTORY_FILE):
+        return default_data
+    try:
+        with open(MEAL_HISTORY_FILE, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return {**default_data, **data} 
+            else:
+                return default_data
+    except (json.JSONDecodeError, FileNotFoundError):
+        return default_data
+
+def save_memory_data(data):
+    """Saves all memory data to the local JSON file."""
+    try:
+        with open(MEAL_HISTORY_FILE, 'w') as f:
+            json.dump(data, f)
+        return True
+    except Exception as e:
+        log_action("MEMORY_SAVE", {"data": "..."*10}, "FAIL", f"Could not save memory: {e}")
+        return False
+
+def add_to_meal_history(recipe_title: str):
+    """Adds a new recipe to the meal history."""
+    data = get_memory_data()
+    history = data['history']
+    
+    if recipe_title in history:
+        history.remove(recipe_title)
+
+    history.insert(0, recipe_title)
+    data['history'] = history[:10]
+    
+    return save_memory_data(data)
+
+def add_disliked_ingredients_from_recipe(recipe_markdown: str):
+    """Parses a deleted recipe for its ingredients and adds them to the disliked list."""
+    data = get_memory_data()
+    
+    match = re.search(r"### \*\*Ingredients:\*\*.*?\n\n(.*?)\n\n###", recipe_markdown, re.DOTALL)
+    if not match:
+        log_action("MEMORY_DISLIKE", {}, "FAIL", "Could not find ingredient list in recipe content.")
+        return False
+
+    ingredients_block = match.group(1)
+    
+    raw_ingredients = re.findall(r'^\*\s*(.+?)(?:,\s*\d+.*)?$', ingredients_block, re.MULTILINE)
+    
+    new_dislikes = data['disliked_ingredients']
+    for item in raw_ingredients:
+        item_name = item.split(',')[0].strip().lower()
+        if item_name and item_name not in new_dislikes:
+            new_dislikes.append(item_name)
+    
+    data['disliked_ingredients'] = new_dislikes
+    log_action("MEMORY_DISLIKE", {"count": len(raw_ingredients)}, "SUCCESS", f"Learned {len(raw_ingredients)} disliked ingredients: {', '.join(new_dislikes)}")
+    
+    return save_memory_data(data)
+
+def add_disliked_ingredients_from_chat(ingredients: list[str]):
+    """Adds ingredients directly from chat input."""
+    data = get_memory_data()
+    new_dislikes = data['disliked_ingredients']
+    learned_count = 0
+    
+    for item in ingredients:
+        item = item.strip().lower()
+        if item and item not in new_dislikes:
+            new_dislikes.append(item)
+            learned_count += 1
+            
+    data['disliked_ingredients'] = new_dislikes
+    save_memory_data(data)
+    
+    if learned_count > 0:
+        log_action("PREFERENCE_LEARNED", {"items": ingredients}, "SUCCESS", f"Learned {learned_count} new dislike(s).")
+        return f"Understood! I've added {', '.join(ingredients)} to your list of disliked foods."
+    else:
+        return "I already knew about those foods, chef. Anything else I can help with?"
+
+
+def mock_weather_api(location="Your Area"):
+    """Simulates a call to a weather API to get current conditions."""
+    current_hour = datetime.now().hour
+    
+    if 6 <= current_hour < 10:
+        return f"The current weather in {location} is 55°F (13°C) and cloudy. Perfect for a warm breakfast."
+    elif 10 <= current_hour < 16:
+        return f"The current weather in {location} is 88°F (31°C) and sunny. Highly recommend a COOL, NO-COOK meal."
+    else: # Evening/Night
+        return f"The current weather in {location} is 68°F (20°C) and clear. Good for a comforting dinner."
+
+# --- AGENT DSL DEFINITION (Same as previous, included for prompt context) ---
+DSL_SPECIFICATION = """..."""
+
+# --- 2. PROMPT ENGINEERING (Context Injection) ---
 
 def create_recipe_prompt(user_input):
     """
-    Assembles the full, engineered prompt string based on dynamic chat input.
+    Assembles the full, engineered prompt string, injecting MEAL HISTORY and WEATHER context.
     """
+    memory_data = get_memory_data()
+    meal_history = memory_data['history']
+    disliked_ingredients = memory_data['disliked_ingredients']
+    weather_report = mock_weather_api()
+
     system_instruction = (
         "You are Chef Remy, the world-class, budget-conscious rat chef from the movie Ratatouille. \n"
         "Your tone is encouraging, patient, and focused on simplicity. \n"
-        "Your goal is to interpret the user's ingredients, servings, and constraints from their chat message. \n"
+        "Your goal is to interpret the user's request and provide a recipe.\n"
+        "\n"
+        "**CONTEXTUAL RULES FOR ADAPTIVE LEARNING:**\n"
+        f"1. **WEATHER:** {weather_report}. Adjust recipe type based on temperature (e.g., hot -> no-cook/salads; cold -> stew/bake).\n"
+        f"2. **HISTORY:** The user recently cooked: {', '.join(meal_history) if meal_history else 'No recent meals recorded.'}. DO NOT suggest a recipe with the EXACT same name.\n"
+        f"3. **DISLIKED:** The user has indicated they dislike recipes containing: {', '.join(disliked_ingredients) if disliked_ingredients else 'None.'}. AVOID using these ingredients unless EXPLICITLY requested by the user.\n"
+        "\n"
         "After generating the complete recipe, you MUST generate a structured action plan. \n"
         "Your final output MUST contain two parts: the Recipe Template and the [ACTIONS] block, with NO other commentary."
     )
@@ -123,19 +220,14 @@ def create_recipe_prompt(user_input):
         """
         Second, generate a structured plan. You MUST include one SAVE_RECIPE action to save the recipe and two scheduling actions based on the recipe's Total Time.
         
-        CRITICAL SCHEDULING RULE:
-        1. If the user specifies a desired start time (e.g., 'start at 7 PM' or 'cook in 30 minutes'), use that explicit time for ACTION_2.
-        2. If NO specific time is mentioned, default the start time to '5 minutes from now'.
-        
         [ACTIONS]
         ACTION_1: SAVE_RECIPE(filename='<DISH NAME>', content='RECIPE MARKDOWN CONTENT')
-        ACTION_2: ADD_CALENDAR_EVENT(title='Cook <DISH NAME>', time='<SPECIFIED TIME OR 5 minutes from now>', duration='<TOTAL TIME>')
-        ACTION_3: ADD_REMINDER(time='<TIME FROM ACTION 2> plus <TOTAL TIME>', message='Check on <DISH NAME>! This meal is ready.')
+        ACTION_2: ADD_CALENDAR_EVENT(title='Cook <DISH NAME>', time='5 minutes from now', duration='<TOTAL TIME>')
+        ACTION_3: ADD_REMINDER(time='5 minutes plus <TOTAL TIME> from now', message='Check on <DISH NAME>! This meal is ready.')
         """
-        # --- END OF CUSTOMIZED ACTION BLOCK ---
     )
 
-    return f"System Instruction: {system_instruction}\n\nUser Request: {user_input}\n\n{template_instruction}\n\n{DSL_SPECIFICATION}"
+    return f"System Instruction: {system_instruction}\n\nUser Request: {user_input}\n\n{template_instruction}"
 
 # --- 3. API CALL LOGIC (To Get Recipe and Actions) ---
 
@@ -217,7 +309,6 @@ def execute_add_reminder(time: str, message: str) -> tuple[bool, str]:
     
     resolved_time_str = resolve_time_to_absolute(time)
     
-    # Store clean title (e.g., "Quick Soy Sauce Egg Rice")
     clean_title = message.replace('Check on ', '').replace('! This meal is ready.', '').strip()
 
     result_message = f"Reminder set: '{message}' at {resolved_time_str}."
@@ -250,7 +341,7 @@ def execute_add_calendar_event(title: str, time: str, duration: str) -> tuple[bo
     return True, result_message
 
 def execute_save_recipe(filename: str, content: str) -> tuple[bool, str]:
-    """Saves the recipe content to a local file (File I/O action)."""
+    """Saves the recipe content to a local file (File I/O action) AND updates meal history."""
     
     illegal_chars = r'[<>:"/\\|?*\'`]'
     sanitized_filename = re.sub(illegal_chars, '', filename).replace(' ', '_').replace('**', '').replace('__', '')
@@ -261,6 +352,9 @@ def execute_save_recipe(filename: str, content: str) -> tuple[bool, str]:
     try:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
+        
+        add_to_meal_history(filename)
+        
         return True, f"Recipe saved successfully to `{clean_filename}`"
     except Exception as e:
         return False, f"File I/O Error: Could not save recipe. {e} Filepath attempted: {file_path}"
@@ -268,15 +362,25 @@ def execute_save_recipe(filename: str, content: str) -> tuple[bool, str]:
 # --- Deletion Logic ---
 
 def delete_recipe_and_events(filename: str, title: str):
-    """Deletes the saved recipe file and all associated events/reminders from session state."""
+    """Performs the final deletion and memory update after user confirmation."""
     file_path = os.path.join(SAVED_RECIPES_DIR, filename)
     status_emoji = "❌"
     
+    recipe_markdown = ""
+    try:
+        with open(file_path, 'r', encoding="utf-8") as f: 
+            recipe_markdown = f.read()
+    except Exception:
+        pass 
+        
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
             file_result = f"File '{filename}' deleted successfully."
             status_emoji = "✅"
+            
+            # --- Memory learning logic is now triggered in the confirmation form handler ---
+            
         else:
             file_result = f"File '{filename}' not found."
             
@@ -298,15 +402,62 @@ def delete_recipe_and_events(filename: str, title: str):
     
     log_action("DELETE_SCHEDULE", {"title": title}, "✅" if deleted_count > 0 else "ℹ️", event_result)
     
-    st.success(f"Deletion Complete: {file_result} and {event_result}")
+    st.success(f"Deletion Complete: {file_result} and {event_result}.")
+    st.session_state.confirm_dislikes = None # Clear the confirmation state
+    st.rerun() # Rerun to refresh the Recipe Book page
 
+
+def prepare_delete_and_dislike(filename: str, title: str):
+    """
+    Triggers the two-step deletion process by setting the confirmation state.
+    """
+    file_path = os.path.join(SAVED_RECIPES_DIR, filename)
+    
+    try:
+        with open(file_path, 'r', encoding="utf-8") as f: 
+            recipe_markdown = f.read()
+    except Exception:
+        st.error("Could not read recipe content. Cannot determine ingredients for dislike memory.")
+        return 
+        
+    # Extract existing ingredients for pre-population
+    match = re.search(r"### \*\*Ingredients:\*\*.*?\n\n(.*?)\n\n###", recipe_markdown, re.DOTALL)
+    ingredients_block = match.group(1) if match else ""
+    
+    # Simple extraction of main ingredients (first word of each line)
+    raw_ingredients = re.findall(r'^\*\s*(.+?)(?:,\s*\d+.*)?$', ingredients_block, re.MULTILINE)
+    default_dislikes = [item.split(',')[0].strip().lower() for item in raw_ingredients]
+    
+    # Set the state variable to trigger the confirmation form
+    st.session_state.confirm_dislikes = {
+        "filename": filename,
+        "title": title,
+        "default_dislikes": ", ".join(default_dislikes)
+    }
+    st.rerun() # Force rerun to show the form
 
 # --- EXECUTION FLOW ---
 
 def process_query_and_run(user_input):
     """Handles the long-running API call and execution phase (Run 2)."""
     
-    # 1. Generate Content and Plan
+    # --- STEP 0: Check for Dislike Intent (New Intent Classification) ---
+    dislike_pattern = r"(?:i\s+don['\s+]t\s+(?:like|want)|i\s+hate|avoid|no|exclude)\s+(.+)"
+    
+    match = re.search(dislike_pattern, user_input, re.IGNORECASE)
+    
+    if match:
+        raw_dislikes = match.group(1)
+        disliked_items = [item.strip() for item in re.split(r',\s*|\s+and\s*|\s+', raw_dislikes) if item.strip()]
+        
+        if disliked_items:
+            response_message = add_disliked_ingredients_from_chat(disliked_items)
+            st.session_state.messages.append({"role": "assistant", "content": response_message})
+            st.session_state.processing_query = None # Clear flag and stop the cycle
+            return
+
+    # --- Step 1: Proceed with Recipe Generation (Original Logic) ---
+    
     with st.spinner(f"Chef Remy is generating your recipe and action plan..."):
         full_prompt = create_recipe_prompt(user_input)
         recipe_markdown, action_block = generate_content_and_plan(full_prompt)
@@ -423,11 +574,9 @@ def resolve_time_to_absolute(time_str):
         target_time = now
         total_minutes = 0
         
-        # Look for complex structure: e.g., '5 minutes plus 40 minutes from now'
-        # Split by keywords that separate time increments
-        time_parts = re.split(r'plus|and', time_str)
+        parts = re.split(r'plus|and', time_str)
         
-        for part in time_parts:
+        for part in parts:
             part = part.strip()
             # Extract hours
             match_hours = re.findall(r'(\d+)\s*hour|hr', part)
@@ -471,6 +620,53 @@ def parse_duration_to_hours(duration_str):
 def render_saved_recipes():
     st.header("Recipe Book 📚")
     
+    # --- RENDER DISLIKE CONFIRMATION FORM IF STATE IS SET ---
+    if st.session_state.confirm_dislikes:
+        data = st.session_state.confirm_dislikes
+        
+        with st.container():
+            st.warning(f"🗑️ Deleting **{data['title']}**.")
+            st.markdown("---")
+            st.subheader("Step 2: Adaptive Learning Confirmation")
+            st.markdown(f"**Recipe Title:** `{data['title']}`")
+            st.markdown("Since you are deleting this recipe, the agent should learn what you disliked about it. **Edit the list below to confirm the ingredients to be avoided in the future.**")
+            
+            with st.form("dislike_confirmation_form"):
+                
+                dislike_input = st.text_input(
+                    "Ingredients to add to your permanent 'Disliked' list (comma-separated):",
+                    value=data['default_dislikes'],
+                    key="final_dislike_list"
+                )
+                
+                col1, col2 = st.columns(2)
+                
+                final_confirm = col1.form_submit_button("✅ Confirm Deletion & Update Memory", type="primary")
+                cancel = col2.form_submit_button("❌ Cancel Deletion", type="secondary")
+                
+                if final_confirm:
+                    # 1. Process the user's final list of dislikes
+                    final_dislikes = [item.strip() for item in dislike_input.split(',') if item.strip()]
+                    
+                    # 2. Add the final confirmed dislikes to memory
+                    add_disliked_ingredients_from_chat(final_dislikes)
+                    
+                    # 3. Perform the actual file and schedule deletion
+                    delete_recipe_and_events(data['filename'], data['title'])
+                    
+                    # NOTE: delete_recipe_and_events performs st.rerun() at the end
+                
+                if cancel:
+                    st.session_state.confirm_dislikes = None
+                    st.rerun()
+        
+        st.markdown("---")
+        st.markdown("### Saved Recipes (Deletion Locked)")
+    
+    else:
+        st.markdown("### Saved Recipes")
+    # --- END DISLIKE CONFIRMATION FORM ---
+    
     recipe_files = [f for f in os.listdir(SAVED_RECIPES_DIR) if f.endswith('.md')]
     
     if not recipe_files:
@@ -482,17 +678,20 @@ def render_saved_recipes():
         title_for_display = filename.replace('.md', '').replace('_', ' ')
         raw_title = filename.replace('.md', '') 
         
+        # Create a form for the delete button to prevent rerun issues
         with st.form(key=f"delete_form_{raw_title}"):
             st.markdown(f"**{title_for_display}**")
             
+            # Use disabled=True if a deletion is already pending
             delete_button = st.form_submit_button(
                 label="🗑️ Delete Recipe & Schedule",
-                help="Deletes the local file and all associated reminders/events."
+                help="Triggers deletion confirmation. This action cannot be undone.",
+                disabled=st.session_state.confirm_dislikes is not None
             )
 
             if delete_button:
-                delete_recipe_and_events(filename, raw_title)
-                st.rerun() 
+                # TRIGER STEP 1: Set the confirmation state
+                prepare_delete_and_dislike(filename, raw_title) 
             
             with st.expander("View Recipe Details"):
                 try:
@@ -601,7 +800,7 @@ def render_scheduled_events():
         
         current_hour += 1
 
-# --- Render Functions for Sidebar Navigation ---
+# --- Render Functions for Sidebar Navigation (Moved to bottom for clarity) ---
 
 def render_chat_tab():
     st.title("💬 Chef Remy Chat")
@@ -620,6 +819,26 @@ def render_chat_tab():
     # Chat input handling (Run 1: Capture and Rerun)
     if st.session_state.processing_query is None:
         if prompt := st.chat_input("Ask Chef Remy to cook or access a recipe..."):
+            
+            # --- CHECK FOR DIRECT PREFERENCE LEARNING ---
+            dislike_pattern = r"(?:i\s+don['\s+]t\s+(?:like|want)|i\s+hate|avoid|no|exclude)\s+(.+)"
+            match = re.search(dislike_pattern, prompt, re.IGNORECASE)
+            
+            if match:
+                raw_dislikes = match.group(1)
+                # Split keywords by commas, 'and', or space
+                disliked_items = [item.strip() for item in re.split(r',\s*|\s+and\s*|\s+', raw_dislikes) if item.strip()]
+                
+                if disliked_items:
+                    # Execute preference learning and provide feedback immediately
+                    response_message = add_disliked_ingredients_from_chat(disliked_items)
+                    st.session_state.messages.append({"role": "user", "content": prompt}) # User input is displayed
+                    st.session_state.messages.append({"role": "assistant", "content": response_message})
+                    
+                    st.rerun() 
+                    return # Exit function after handling preference
+            
+            # --- NO PREFERENCE DETECTED: Proceed with Recipe Generation ---
             st.session_state.messages.append({"role": "user", "content": prompt})
             st.session_state.processing_query = prompt
             st.rerun()
@@ -643,12 +862,18 @@ if st.session_state.processing_query:
 with st.sidebar:
     st.header("Agent Navigation")
     
-    # NEW: Sidebar radio buttons replace tabs
     st.session_state.current_view = st.radio(
         "Go to:",
         ["💬 Chef Remy Chat", "📚 Saved Recipe Book", "📅 Scheduled Actions", "📜 Agent Audit Log"],
         key="sidebar_navigation_key"
     )
+    
+    st.markdown("---")
+    st.header("Adaptive Memory")
+    
+    memory_data = get_memory_data() 
+    st.caption(f"**Recently Cooked ({len(memory_data['history'])}):** {', '.join(memory_data['history']) if memory_data['history'] else 'None.'}")
+    st.caption(f"**Disliked Ingredients ({len(memory_data['disliked_ingredients'])}):** {', '.join(memory_data['disliked_ingredients']) if memory_data['disliked_ingredients'] else 'None.'}")
     
     st.markdown("---")
     st.header("Controls & Safety")
@@ -666,7 +891,6 @@ with st.sidebar:
     
     st.markdown("---")
     st.caption("Instructions: Type a request like 'I have leftover rice, eggs, and soy sauce. Make a quick dinner for one.'")
-
 
 # --- CONDITIONAL RENDERING ---
 
